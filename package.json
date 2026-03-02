@@ -1,0 +1,17 @@
+{
+  "name": "opencode-slave",
+  "version": "1.0.0",
+  "main": "src/cli.js",
+  "scripts": {
+    "test": "node --test",
+    "start": "node src/cli.js",
+    "install:opencode": "node scripts/install-opencode.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "description": "Autonomous task runner for OpenCode repositories",
+  "bin": {
+    "slave": "bin/slave.js"
+  }
+}
