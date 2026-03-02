@@ -18,12 +18,51 @@ This README is an operations guide focused on real usage.
 
 ## Install
 
+Prerequisites:
+
+- Node.js + npm
+- OpenCode CLI
+- Git (required for no-clone installer path)
+
+### Option A: from local clone (recommended for contributors)
+
+macOS / Linux:
+
+```bash
+./install.sh --local
+```
+
+Windows (PowerShell):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install.ps1 -Local
+```
+
+### Option B: no clone required
+
+Replace `<owner>/<repo>` with your repository path once.
+
+macOS / Linux:
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/<owner>/<repo>/main/install.sh" | OPENCODE_SLAVE_REPO_URL="https://github.com/<owner>/<repo>.git" bash
+```
+
+Windows (PowerShell):
+
+```powershell
+$env:OPENCODE_SLAVE_REPO_URL = "https://github.com/<owner>/<repo>.git"
+irm "https://raw.githubusercontent.com/<owner>/<repo>/main/install.ps1" | iex
+```
+
+### Option C: manual install from current checkout
+
 ```bash
 npm install
 npm run install:opencode
 ```
 
-`npm run install:opencode` installs `/slave-*` slash commands in your OpenCode profile:
+`npm run install:opencode` (or either installer script) installs `/slave-*` slash commands in your OpenCode profile:
 
 - Commands: `~/.config/opencode/commands`
 - Wrapper script: `~/.config/opencode/scripts/opencode-slave.js`
