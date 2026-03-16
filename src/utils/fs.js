@@ -93,6 +93,40 @@ async function listFilesRecursive(dirPath, options = {}) {
   return files;
 }
 
+async function copyPath(sourcePath, destinationPath) {
+  const stats = await fs.lstat(sourcePath);
+
+  if (stats.isDirectory()) {
+    await ensureDir(destinationPath);
+    const entries = await fs.readdir(sourcePath, { withFileTypes: true });
+    for (const entry of entries) {
+      await copyPath(
+        path.join(sourcePath, entry.name),
+        path.join(destinationPath, entry.name)
+      );
+    }
+    return;
+  }
+
+  if (stats.isSymbolicLink()) {
+    const linkTarget = await fs.readlink(sourcePath);
+    await ensureDir(path.dirname(destinationPath));
+    await fs.symlink(linkTarget, destinationPath).catch(async (error) => {
+      if (error && error.code === "EEXIST") {
+        await fs.rm(destinationPath, { recursive: true, force: true });
+        await fs.symlink(linkTarget, destinationPath);
+        return;
+      }
+
+      throw error;
+    });
+    return;
+  }
+
+  await ensureDir(path.dirname(destinationPath));
+  await fs.copyFile(sourcePath, destinationPath);
+}
+
 module.exports = {
   pathExists,
   ensureDir,
@@ -102,4 +136,5 @@ module.exports = {
   removeIfExists,
   listSubdirectories,
   listFilesRecursive,
+  copyPath,
 };

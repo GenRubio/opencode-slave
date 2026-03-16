@@ -11,6 +11,7 @@ This README is an operations guide focused on real usage.
 - Task registry in `.opencode-slave/tasks.json`
 - Per-task workspace at `.opencode-slave/tasks/{taskName}`
 - Auto executor mode (`__auto__`) that attaches `TASK.md` + all `context/*` files
+- Optional reviewer gate per task with feedback loop back into `context/`
 - Sequential mode (same repo) and worktree mode (separate branch per task)
 - Background execution and recovery (`slave-resume`)
 - Human-in-the-loop state (`waiting_input`) when clarification is needed
@@ -166,7 +167,12 @@ Per-task branch/worktree toggle (inside each `task.json`):
 {
   "runInWorktree": true,
   "branchName": null,
-  "baseBranch": null
+  "baseBranch": null,
+  "useCurrentBranchAsBase": false,
+  "review": {
+    "mode": "none",
+    "commandTemplate": "__auto__"
+  }
 }
 ```
 
@@ -174,6 +180,9 @@ Per-task branch/worktree toggle (inside each `task.json`):
 - `false`: run that task in the current branch/workspace
 - `branchName`: optional explicit branch name for that task (`null` = auto `branchPrefix + taskName`)
 - `baseBranch`: optional base branch for that task (`null` = global `config.baseBranch`)
+- `useCurrentBranchAsBase`: if `true`, use the currently checked out branch as the base when the worktree is created
+- `review.mode`: `none` or `agent`
+- `review.commandTemplate`: reviewer command (`__auto__` = OpenCode reviewer agent)
 
 ## Status lifecycle
 
@@ -261,17 +270,29 @@ Per-task control option:
 {
   "runInWorktree": true,
   "branchName": "feature/navbar-redesign",
-  "baseBranch": "dev"
+  "baseBranch": "dev",
+  "useCurrentBranchAsBase": false
 }
 ```
 
 If either value is `null`, global defaults are used.
+
+To force a task to branch from whatever branch you are on when it starts:
+
+```json
+{
+  "runInWorktree": true,
+  "useCurrentBranchAsBase": true
+}
+```
 
 Branch/worktree behavior:
 
 - Branch name per task: `{branchPrefix}{taskName}`
 - Worktree path: `{worktreeBasePath}/{repoName}-slave-{taskName}`
 - Base for new branch: tries `origin/{baseBranch}` first, then local `{baseBranch}` fallback
+- If `useCurrentBranchAsBase` is `true`, the task worktree uses the branch currently checked out at launch time
+- Ignored local files like `.env` are copied into the task worktree after creation, except internal `.git` and `.opencode-slave`
 
 `opencodeInactivityTimeoutSec` interrupts `__auto__` executions when no stdout/stderr is produced for too long, so tasks do not stay stuck in `started` forever.
 
@@ -334,6 +355,38 @@ In this mode the runner:
 - Always attaches `TASK.md`
 - Always attaches all files under `context/`
 - Builds and runs an `opencode run` command
+
+### Reviewer gate
+
+You can enable a reviewer per task in `.opencode-slave/tasks/{name}/task.json`:
+
+```json
+{
+  "review": {
+    "mode": "agent",
+    "commandTemplate": "__auto__"
+  }
+}
+```
+
+Behavior:
+
+- Reviewer runs only after the implementation command succeeds
+- Reviewer is instructed to stay read-only and verify the task against `TASK.md` + `context/*`
+- On reviewer failure, feedback is written to `context/review-feedback.md`
+- Next retry automatically receives that feedback because all `context/*` files are attached again
+- Latest reviewer report is stored in `output/review.json`
+
+You can also use a deterministic custom reviewer command:
+
+```json
+{
+  "review": {
+    "mode": "agent",
+    "commandTemplate": "npm test"
+  }
+}
+```
 
 ### Custom executor
 

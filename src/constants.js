@@ -26,6 +26,7 @@ const DEFAULT_CONFIG = {
   schemaVersion: SCHEMA_VERSION,
   baseBranch: "main",
   autonomyMode: "high",
+  reviewMode: "none",
   maxParallel: 2,
   defaultMaxRetries: 3,
   defaultInvestigationBudget: 8,

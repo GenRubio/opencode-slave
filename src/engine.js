@@ -64,6 +64,14 @@ function getTaskAnswersPath(rootDir, taskName) {
   return path.join(getTaskContextDir(rootDir, taskName), "answers.md");
 }
 
+function getTaskReviewFeedbackPath(rootDir, taskName) {
+  return path.join(getTaskContextDir(rootDir, taskName), "review-feedback.md");
+}
+
+function getTaskReviewResultPath(rootDir, taskName) {
+  return path.join(getTaskDir(rootDir, taskName), "output", "review.json");
+}
+
 function getTaskCheckpointPath(rootDir, taskName) {
   return path.join(rootDir, ".opencode-slave", "runtime", "checkpoints", `${taskName}.checkpoint.json`);
 }
@@ -84,6 +92,15 @@ function asArray(value) {
   return [];
 }
 
+function normalizeReviewMode(value) {
+  const normalized = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (["agent", "llm", "reviewer"].includes(normalized)) {
+    return "agent";
+  }
+
+  return "none";
+}
+
 function mergeTaskWithConfig(task, taskConfig, globalConfig) {
   const branchName = typeof taskConfig.branchName === "string" && taskConfig.branchName.trim().length > 0
     ? taskConfig.branchName.trim()
@@ -91,6 +108,12 @@ function mergeTaskWithConfig(task, taskConfig, globalConfig) {
   const baseBranch = typeof taskConfig.baseBranch === "string" && taskConfig.baseBranch.trim().length > 0
     ? taskConfig.baseBranch.trim()
     : null;
+  const useCurrentBranchAsBase = Boolean(taskConfig.useCurrentBranchAsBase ?? task.useCurrentBranchAsBase ?? false);
+  const reviewConfig = taskConfig.review || {};
+  const reviewCommandTemplate =
+    typeof reviewConfig.commandTemplate === "string" && reviewConfig.commandTemplate.trim().length > 0
+      ? reviewConfig.commandTemplate.trim()
+      : task.reviewCommandTemplate || DEFAULT_EXECUTOR_COMMAND_TEMPLATE;
 
   return {
     ...task,
@@ -101,6 +124,9 @@ function mergeTaskWithConfig(task, taskConfig, globalConfig) {
     runInWorktree: Boolean(taskConfig.runInWorktree ?? task.runInWorktree ?? false),
     branchName,
     baseBranch,
+    useCurrentBranchAsBase,
+    reviewMode: normalizeReviewMode(reviewConfig.mode ?? task.reviewMode ?? globalConfig.reviewMode),
+    reviewCommandTemplate,
     investigationBudget: Number(
       taskConfig.investigationBudget ?? task.investigationBudget ?? globalConfig.defaultInvestigationBudget
     ),
@@ -212,6 +238,14 @@ function getProviderModel(config) {
   return null;
 }
 
+function getReviewProviderModel(config) {
+  if (config.reviewProvider && config.reviewModel) {
+    return `${config.reviewProvider}/${config.reviewModel}`;
+  }
+
+  return getProviderModel(config);
+}
+
 function escapeDoubleQuotes(value) {
   return String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 }
@@ -264,7 +298,7 @@ function formatQuestionsMarkdown(taskName, reason, questions) {
   return `${lines.join("\n")}\n`;
 }
 
-function createTaskStreamLogger(logPath) {
+function createTaskStreamLogger(logPath, prefix = "") {
   let writeQueue = Promise.resolve();
   let stdoutBuffer = "";
   let stderrBuffer = "";
@@ -297,9 +331,10 @@ function createTaskStreamLogger(logPath) {
     const parts = normalized.split("\n");
     const completeLines = parts.slice(0, -1);
     const remaining = parts[parts.length - 1] || "";
+    const streamLabel = prefix ? `${prefix}${stream}` : stream;
 
     for (const line of completeLines) {
-      enqueue(`[${nowIso()}] ${stream}: ${line}`);
+      enqueue(`[${nowIso()}] ${streamLabel}: ${line}`);
     }
 
     if (stream === "stdout") {
@@ -310,13 +345,15 @@ function createTaskStreamLogger(logPath) {
   }
 
   async function flush() {
+    const stdoutLabel = prefix ? `${prefix}stdout` : "stdout";
+    const stderrLabel = prefix ? `${prefix}stderr` : "stderr";
     if (stdoutBuffer.length > 0) {
-      enqueue(`[${nowIso()}] stdout: ${stdoutBuffer}`);
+      enqueue(`[${nowIso()}] ${stdoutLabel}: ${stdoutBuffer}`);
       stdoutBuffer = "";
     }
 
     if (stderrBuffer.length > 0) {
-      enqueue(`[${nowIso()}] stderr: ${stderrBuffer}`);
+      enqueue(`[${nowIso()}] ${stderrLabel}: ${stderrBuffer}`);
       stderrBuffer = "";
     }
 
@@ -372,6 +409,26 @@ function buildAutoTaskCommand(taskFile, contextFiles, config) {
   return `opencode run${modelArg}${fileArgs} -- "${escapeDoubleQuotes(prompt)}"`;
 }
 
+function buildAutoReviewCommand(taskFile, contextFiles, config) {
+  const providerModel = getReviewProviderModel(config);
+  const modelArg = providerModel ? ` -m "${providerModel}"` : "";
+  const attachedFiles = [taskFile, ...contextFiles];
+  const fileArgs = attachedFiles.map((filePath) => ` -f "${escapeDoubleQuotes(filePath)}"`).join("");
+  const hasContext = contextFiles.length > 0;
+  const prompt =
+    `Review the implementation for the task defined in ${taskFile} in the current repository. ` +
+    "First read all attached files. " +
+    (hasContext
+      ? "Use the attached context files as the source of truth for requirements and prior feedback. "
+      : "Inspect the repository carefully before deciding. ") +
+    "You are a reviewer only: do not edit files, do not commit, and do not change the workspace. " +
+    "Verify every success criterion, inspect the changed code, and run validation commands from TASK.md when useful. " +
+    "Finish with these exact markers: REVIEW_VERDICT: PASS or FAIL, REVIEW_SUMMARY: <one sentence>, REVIEW_ISSUES: followed by bullet lines. " +
+    "When the task passes, write '- none' under REVIEW_ISSUES.";
+
+  return `opencode run${modelArg}${fileArgs} -- "${escapeDoubleQuotes(prompt)}"`;
+}
+
 function hasUserTaskInstructions(taskMarkdown) {
   if (!taskMarkdown) {
     return false;
@@ -416,6 +473,143 @@ async function buildTaskCommand(template, rootDir, taskName, taskWorkspace, conf
     .replaceAll("{taskFile}", taskFile)
     .replaceAll("{workspace}", taskWorkspace)
     .replaceAll("{providerModel}", getProviderModel(config) || "");
+}
+
+async function buildReviewCommand(template, rootDir, taskName, taskWorkspace, config) {
+  const taskDir = getTaskDir(rootDir, taskName);
+  const taskFile = path.join(taskDir, "TASK.md");
+  const contextFiles = await listFilesRecursive(getTaskContextDir(rootDir, taskName), {
+    maxFiles: 50,
+    maxDepth: 8,
+  });
+
+  if (!template || template === DEFAULT_EXECUTOR_COMMAND_TEMPLATE || template === "__auto__") {
+    return buildAutoReviewCommand(taskFile, contextFiles, config);
+  }
+
+  return template
+    .replaceAll("{taskName}", taskName)
+    .replaceAll("{taskDir}", taskDir)
+    .replaceAll("{taskFile}", taskFile)
+    .replaceAll("{workspace}", taskWorkspace)
+    .replaceAll("{providerModel}", getProviderModel(config) || "")
+    .replaceAll("{reviewProviderModel}", getReviewProviderModel(config) || "");
+}
+
+function parseReviewIssues(text) {
+  const lines = String(text || "")
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd());
+  const startIndex = lines.findIndex((line) => /^REVIEW_ISSUES:/i.test(line.trim()));
+  if (startIndex === -1) {
+    return [];
+  }
+
+  const issues = [];
+  const firstLine = lines[startIndex].replace(/^REVIEW_ISSUES:/i, "").trim();
+  if (firstLine && !/^none$/i.test(firstLine)) {
+    issues.push(firstLine.replace(/^-\s*/, "").trim());
+  }
+
+  for (let index = startIndex + 1; index < lines.length; index += 1) {
+    const trimmed = lines[index].trim();
+    if (!trimmed) {
+      if (issues.length > 0) {
+        break;
+      }
+      continue;
+    }
+
+    if (/^[A-Z_]+:/.test(trimmed)) {
+      break;
+    }
+
+    if (/^-\s*/.test(trimmed)) {
+      const issue = trimmed.replace(/^-\s*/, "").trim();
+      if (issue && !/^none$/i.test(issue)) {
+        issues.push(issue);
+      }
+      continue;
+    }
+
+    if (issues.length > 0) {
+      break;
+    }
+  }
+
+  return issues.slice(0, 12);
+}
+
+function parseReviewResult({ stdout, stderr, result, autoMode }) {
+  const combined = stripAnsi(`${stdout || ""}\n${stderr || ""}`);
+  const verdictMatch = combined.match(/REVIEW_VERDICT:\s*(PASS|FAIL)/i);
+  const summaryMatch = combined.match(/REVIEW_SUMMARY:\s*(.+)/i);
+  const issues = parseReviewIssues(combined);
+  const verdict = verdictMatch ? verdictMatch[1].toUpperCase() : null;
+  const summary = summaryMatch
+    ? summaryMatch[1].trim()
+    : verdict === "PASS"
+      ? "Reviewer approved the implementation."
+      : verdict === "FAIL"
+        ? "Reviewer rejected the implementation."
+        : null;
+
+  if (verdict) {
+    return {
+      parsed: true,
+      verdict,
+      passed: verdict === "PASS",
+      summary,
+      issues,
+    };
+  }
+
+  if (!autoMode) {
+    const passed = result.code === 0 && !result.timedOut;
+    return {
+      parsed: false,
+      verdict: passed ? "PASS" : "FAIL",
+      passed,
+      summary: passed
+        ? "Custom reviewer command completed successfully."
+        : "Custom reviewer command failed.",
+      issues,
+    };
+  }
+
+  return {
+    parsed: false,
+    verdict: "FAIL",
+    passed: false,
+    summary: "Reviewer output was not parsable.",
+    issues: issues.length > 0 ? issues : ["Missing REVIEW_VERDICT marker in reviewer output."],
+  };
+}
+
+function formatReviewFeedbackMarkdown(taskName, review) {
+  const lines = [
+    `# Reviewer feedback for ${taskName}`,
+    "",
+    `Updated: ${nowIso()}`,
+    "",
+  ];
+
+  for (const item of review.history || []) {
+    lines.push(`## Attempt ${item.attempt}`);
+    lines.push(`Verdict: ${item.verdict}`);
+    lines.push(`Summary: ${item.summary}`);
+    lines.push("Issues:");
+    if ((item.issues || []).length === 0) {
+      lines.push("- none");
+    } else {
+      for (const issue of item.issues) {
+        lines.push(`- ${issue}`);
+      }
+    }
+    lines.push("");
+  }
+
+  return `${lines.join("\n")}\n`;
 }
 
 async function updateRuntimeState(rootDir, patch) {
@@ -464,6 +658,115 @@ function buildStrategies() {
   ];
 }
 
+async function executeReview({
+  rootDir,
+  config,
+  task,
+  taskConfig,
+  mergedTask,
+  taskWorkspace,
+  logPath,
+  attemptNumber,
+}) {
+  if (mergedTask.reviewMode !== "agent") {
+    return {
+      enabled: false,
+      passed: true,
+      verdict: "SKIPPED",
+      summary: "Review disabled for this task.",
+      issues: [],
+      reportPath: null,
+    };
+  }
+
+  const template = taskConfig?.review?.commandTemplate || mergedTask.reviewCommandTemplate;
+  const command = await buildReviewCommand(template, rootDir, task.name, taskWorkspace, config);
+  const autoMode = !template || template === DEFAULT_EXECUTOR_COMMAND_TEMPLATE || template === "__auto__";
+  const beforeSnapshot = await getGitStatusSnapshot(taskWorkspace);
+  const streamLogger = createTaskStreamLogger(logPath, "review ");
+
+  await appendLine(logPath, `[${nowIso()}] Running reviewer command: ${command}`);
+  const result = await runCommand({
+    command,
+    cwd: taskWorkspace,
+    unsetEnv: command.trim().startsWith("opencode run") ? OPENCODE_ENV_UNSET_KEYS : [],
+    timeoutSec: mergedTask.timeoutSec,
+    onStdout: streamLogger.onStdout,
+    onStderr: streamLogger.onStderr,
+  });
+  await streamLogger.flush();
+
+  const afterSnapshot = await getGitStatusSnapshot(taskWorkspace);
+  const workspaceChanged = beforeSnapshot !== null && afterSnapshot !== null && beforeSnapshot !== afterSnapshot;
+  const parsed = parseReviewResult({
+    stdout: result.stdout,
+    stderr: result.stderr,
+    result,
+    autoMode,
+  });
+
+  const issues = [...parsed.issues];
+  if (workspaceChanged) {
+    issues.push("Reviewer modified the workspace, but reviewer runs must be read-only.");
+  }
+
+  const passed = parsed.passed && !workspaceChanged && !result.timedOut && (autoMode || result.code === 0);
+  const summary = workspaceChanged
+    ? "Reviewer changed the workspace and the review was rejected."
+    : result.timedOut
+      ? "Reviewer timed out before producing a final verdict."
+      : parsed.summary;
+  const reviewResult = {
+    enabled: true,
+    passed,
+    verdict: passed ? "PASS" : "FAIL",
+    summary,
+    issues,
+    exitCode: result.code,
+    timedOut: result.timedOut,
+    command,
+    workspaceChanged,
+    reportPath: getTaskReviewResultPath(rootDir, task.name),
+    history: [
+      {
+        attempt: attemptNumber,
+        verdict: passed ? "PASS" : "FAIL",
+        summary,
+        issues,
+      },
+    ],
+  };
+
+  await writeJsonAtomic(reviewResult.reportPath, {
+    taskName: task.name,
+    generatedAt: nowIso(),
+    attempt: attemptNumber,
+    verdict: reviewResult.verdict,
+    passed: reviewResult.passed,
+    summary: reviewResult.summary,
+    issues: reviewResult.issues,
+    exitCode: result.code,
+    timedOut: result.timedOut,
+    workspaceChanged,
+    command,
+    stdout: stripAnsi(result.stdout || "").slice(0, 8000),
+    stderr: stripAnsi(result.stderr || "").slice(0, 8000),
+  });
+
+  if (!passed) {
+    const feedbackPath = getTaskReviewFeedbackPath(rootDir, task.name);
+    await fs.writeFile(
+      feedbackPath,
+      formatReviewFeedbackMarkdown(task.name, {
+        history: [reviewResult.history[0]],
+      }),
+      "utf8"
+    );
+  }
+
+  return reviewResult;
+}
+
 async function executeTask({
   rootDir,
   config,
@@ -483,10 +786,11 @@ async function executeTask({
   let taskWorkspace = rootDir;
 
   if (useWorktree) {
-    worktreeInfo = await createWorktree(rootDir, config, task.name, {
-      branchName: mergedTask.branchName,
-      baseBranch: mergedTask.baseBranch,
-    });
+      worktreeInfo = await createWorktree(rootDir, config, task.name, {
+        branchName: mergedTask.branchName,
+        baseBranch: mergedTask.baseBranch,
+        useCurrentBranchAsBase: mergedTask.useCurrentBranchAsBase,
+      });
     taskWorkspace = worktreeInfo.worktreePath;
   }
 
@@ -704,7 +1008,29 @@ async function executeTask({
 
       const commandSuccess = (result.code === 0 && !result.timedOut) || softOpencodeSuccess;
       const hasResearchSummary = !config.requireResearchSummary || Boolean(investigation.summary);
-      const success = commandSuccess && hasResearchSummary && !waitingInputReason;
+      let reviewResult = null;
+      if (commandSuccess && !waitingInputReason) {
+        reviewResult = await executeReview({
+          rootDir,
+          config,
+          task,
+          taskConfig,
+          mergedTask,
+          taskWorkspace,
+          logPath,
+          attemptNumber,
+        });
+
+        if (reviewResult.enabled) {
+          await appendLine(
+            logPath,
+            `[${nowIso()}] Review verdict: ${reviewResult.verdict} summary=${reviewResult.summary}`
+          );
+        }
+      }
+
+      const reviewPassed = !reviewResult || !reviewResult.enabled || reviewResult.passed;
+      const success = commandSuccess && hasResearchSummary && !waitingInputReason && reviewPassed;
 
       await appendLine(
         logPath,
@@ -718,13 +1044,21 @@ async function executeTask({
         attempt: attemptNumber,
         startedAt: attemptStartedAt,
         finishedAt: nowIso(),
-        exitCode: success ? 0 : result.code,
+        exitCode: success ? 0 : (reviewResult && !reviewPassed ? 1 : result.code),
         error: success
           ? null
-          : waitingInputReason || result.stderr || result.stdout || "Task command failed",
+          : waitingInputReason || (reviewResult && !reviewPassed ? `Review failed: ${reviewResult.summary}` : null) || result.stderr || result.stdout || "Task command failed",
         sourcesChecked: [...(investigation.keywordHits || []), ...(investigation.dbSources || [])].slice(0, 25),
         strategy,
         logFile: path.relative(rootDir, logPath).replace(/\\/g, "/"),
+        review: reviewResult && reviewResult.enabled
+          ? {
+              verdict: reviewResult.verdict,
+              summary: reviewResult.summary,
+              issues: reviewResult.issues,
+              reportFile: path.relative(rootDir, reviewResult.reportPath).replace(/\\/g, "/"),
+            }
+          : null,
       };
 
       if (result.stdout?.trim() && !streamLogger.sawStdout()) {
@@ -802,7 +1136,7 @@ async function executeTask({
           }
 
           if (config.autoPR) {
-            const pr = await maybeCreatePr(taskWorkspace, config, worktreeInfo.branch);
+            const pr = await maybeCreatePr(taskWorkspace, config, worktreeInfo.branch, worktreeInfo.baseBranch);
             if (!pr.created) {
               await logger.warn(`Auto-PR not created for ${task.name}: ${pr.reason}`);
             }
@@ -816,10 +1150,14 @@ async function executeTask({
             0,
             Math.round((new Date(currentTask.finishedAt).getTime() - new Date(currentTask.startedAt).getTime()) / 1000)
           ),
-          artifacts: [path.relative(rootDir, logPath).replace(/\\/g, "/")],
+          artifacts: [
+            path.relative(rootDir, logPath).replace(/\\/g, "/"),
+            ...(attemptRecord.review?.reportFile ? [attemptRecord.review.reportFile] : []),
+          ],
           researchSummary: investigation.summary,
           sourcesChecked: attemptRecord.sourcesChecked,
           strategy,
+          review: attemptRecord.review,
         });
 
         return currentTask;
@@ -833,11 +1171,15 @@ async function executeTask({
             0,
             Math.round((new Date(attemptRecord.finishedAt).getTime() - new Date(attemptRecord.startedAt).getTime()) / 1000)
           ),
-          artifacts: [path.relative(rootDir, logPath).replace(/\\/g, "/")],
+          artifacts: [
+            path.relative(rootDir, logPath).replace(/\\/g, "/"),
+            ...(attemptRecord.review?.reportFile ? [attemptRecord.review.reportFile] : []),
+          ],
           researchSummary: investigation.summary,
           sourcesChecked: attemptRecord.sourcesChecked,
           strategy,
           error: currentTask.error,
+          review: attemptRecord.review,
         });
         return currentTask;
       }
@@ -1094,6 +1436,16 @@ async function cmdReset(rootDir, taskName) {
     await fs.rm(questionsPath, { force: true });
   }
 
+  const reviewFeedbackPath = getTaskReviewFeedbackPath(rootDir, taskName);
+  if (await pathExists(reviewFeedbackPath)) {
+    await fs.rm(reviewFeedbackPath, { force: true });
+  }
+
+  const reviewResultPath = getTaskReviewResultPath(rootDir, taskName);
+  if (await pathExists(reviewResultPath)) {
+    await fs.rm(reviewResultPath, { force: true });
+  }
+
   return `Task '${taskName}' reset to pending.`;
 }
 
@@ -1315,8 +1667,12 @@ function buildDryRun(state) {
     const blocked = dependenciesFinished(task, state) ? "ready" : `blocked by ${task.dependsOn.join(",")}`;
     const mode = task.runInWorktree ? "worktree" : "current";
     const branchTarget = task.runInWorktree ? task.branchName || "(auto by branchPrefix + taskName)" : "-";
-    const baseTarget = task.runInWorktree ? task.baseBranch || "(global baseBranch)" : "-";
-    lines.push(`- ${task.name}: ${task.status} (${blocked}, mode=${mode}, branch=${branchTarget}, base=${baseTarget})`);
+    const baseTarget = task.runInWorktree
+      ? (task.useCurrentBranchAsBase ? "(current branch)" : task.baseBranch || "(global baseBranch)")
+      : "-";
+    lines.push(
+      `- ${task.name}: ${task.status} (${blocked}, mode=${mode}, branch=${branchTarget}, base=${baseTarget}, review=${task.reviewMode || "none"})`
+    );
   }
 
   return lines.join("\n");

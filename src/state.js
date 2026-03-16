@@ -48,6 +48,9 @@ function createTaskRecord(taskName, config) {
     runInWorktree: false,
     branchName: null,
     baseBranch: null,
+    useCurrentBranchAsBase: false,
+    reviewMode: config.reviewMode || "none",
+    reviewCommandTemplate: DEFAULT_EXECUTOR_COMMAND_TEMPLATE,
     branch: null,
     worktree: null,
     processPid: null,
@@ -202,13 +205,18 @@ async function ensureTaskDirectory(rootDir, taskName) {
       runInWorktree: false,
       branchName: null,
       baseBranch: null,
-      investigationBudget: 8,
-      requireDbIntrospection: "auto",
-      tags: [],
-      executor: {
-        commandTemplate: DEFAULT_EXECUTOR_COMMAND_TEMPLATE,
-      },
-    });
+        useCurrentBranchAsBase: false,
+        investigationBudget: 8,
+        requireDbIntrospection: "auto",
+        tags: [],
+        executor: {
+          commandTemplate: DEFAULT_EXECUTOR_COMMAND_TEMPLATE,
+        },
+        review: {
+          mode: "none",
+          commandTemplate: DEFAULT_EXECUTOR_COMMAND_TEMPLATE,
+        },
+      });
   }
 
   return taskDir;

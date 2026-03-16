@@ -38,6 +38,9 @@ test("cmdTask creates task and cmdStatus lists it", async () => {
   assert.equal(taskConfig.runInWorktree, false);
   assert.equal(taskConfig.branchName, null);
   assert.equal(taskConfig.baseBranch, null);
+  assert.equal(taskConfig.useCurrentBranchAsBase, false);
+  assert.equal(taskConfig.review.mode, "none");
+  assert.equal(taskConfig.review.commandTemplate, "__auto__");
 });
 
 test("cmdStart requires git repo when task is configured to run in worktree", async () => {
@@ -88,6 +91,96 @@ test("cmdStart executes task and writes result artifact", async () => {
   const logPath = path.join(root, ".opencode-slave", "tasks", taskName, "logs", "execution.log");
   const log = await fs.readFile(logPath, "utf8");
   assert.match(log, /stdout: ok/);
+});
+
+test("cmdStart runs reviewer gate and stores review artifact on success", async () => {
+  const root = await makeTempDir();
+  const taskName = "review-pass";
+  await cmdTask(root, taskName);
+
+  const taskFile = path.join(root, ".opencode-slave", "tasks", taskName, "TASK.md");
+  await fs.writeFile(
+    taskFile,
+    [
+      `# Task: ${taskName}`,
+      "",
+      "## Descripcion",
+      "Implement a simple proof file.",
+      "",
+      "## Criterios de exito",
+      "The command creates done.txt.",
+    ].join("\n"),
+    "utf8"
+  );
+
+  const taskConfigPath = path.join(root, ".opencode-slave", "tasks", taskName, "task.json");
+  const taskConfig = JSON.parse(await fs.readFile(taskConfigPath, "utf8"));
+  taskConfig.executor.commandTemplate = 'node -e "require(\'fs\').writeFileSync(\'done.txt\', \'ok\'); console.log(\'implemented\')"';
+  taskConfig.review.mode = "agent";
+  taskConfig.review.commandTemplate = 'node -e "console.log(\'REVIEW_VERDICT: PASS\'); console.log(\'REVIEW_SUMMARY: done.txt exists and task passes.\'); console.log(\'REVIEW_ISSUES:\'); console.log(\'- none\')"';
+  await fs.writeFile(taskConfigPath, `${JSON.stringify(taskConfig, null, 2)}\n`, "utf8");
+
+  const output = await cmdStart(root, { parallel: false, dryRun: false, background: false });
+  assert.equal(output, "Sequential run completed.");
+
+  const status = await cmdStatus(root);
+  assert.match(status, /review-pass\tfinished/);
+
+  const resultPath = path.join(root, ".opencode-slave", "tasks", taskName, "output", "result.json");
+  const result = JSON.parse(await fs.readFile(resultPath, "utf8"));
+  assert.equal(result.status, "finished");
+  assert.equal(result.review.verdict, "PASS");
+
+  const reviewPath = path.join(root, ".opencode-slave", "tasks", taskName, "output", "review.json");
+  const review = JSON.parse(await fs.readFile(reviewPath, "utf8"));
+  assert.equal(review.passed, true);
+  assert.equal(review.verdict, "PASS");
+});
+
+test("cmdStart fails task when reviewer rejects implementation", async () => {
+  const root = await makeTempDir();
+  const taskName = "review-fail";
+  await cmdTask(root, taskName);
+
+  const taskFile = path.join(root, ".opencode-slave", "tasks", taskName, "TASK.md");
+  await fs.writeFile(
+    taskFile,
+    [
+      `# Task: ${taskName}`,
+      "",
+      "## Descripcion",
+      "Create an output file.",
+      "",
+      "## Criterios de exito",
+      "The implementation must satisfy the reviewer.",
+    ].join("\n"),
+    "utf8"
+  );
+
+  const taskConfigPath = path.join(root, ".opencode-slave", "tasks", taskName, "task.json");
+  const taskConfig = JSON.parse(await fs.readFile(taskConfigPath, "utf8"));
+  taskConfig.maxRetries = 0;
+  taskConfig.investigationBudget = 1;
+  taskConfig.executor.commandTemplate = 'node -e "require(\'fs\').writeFileSync(\'done.txt\', \'ok\'); console.log(\'implemented\')"';
+  taskConfig.review.mode = "agent";
+  taskConfig.review.commandTemplate = 'node -e "console.log(\'REVIEW_VERDICT: FAIL\'); console.log(\'REVIEW_SUMMARY: Validation is still incomplete.\'); console.log(\'REVIEW_ISSUES:\'); console.log(\'- Missing verification evidence\')"';
+  await fs.writeFile(taskConfigPath, `${JSON.stringify(taskConfig, null, 2)}\n`, "utf8");
+
+  const output = await cmdStart(root, { parallel: false, dryRun: false, background: false });
+  assert.equal(output, "Sequential run completed.");
+
+  const status = await cmdStatus(root);
+  assert.match(status, /review-fail\terror/);
+  assert.match(status, /Review failed: Validation is still incomplete\./);
+
+  const resultPath = path.join(root, ".opencode-slave", "tasks", taskName, "output", "result.json");
+  const result = JSON.parse(await fs.readFile(resultPath, "utf8"));
+  assert.equal(result.status, "error");
+  assert.equal(result.review.verdict, "FAIL");
+
+  const feedbackPath = path.join(root, ".opencode-slave", "tasks", taskName, "context", "review-feedback.md");
+  const feedback = await fs.readFile(feedbackPath, "utf8");
+  assert.match(feedback, /Missing verification evidence/);
 });
 
 test("cmdResume recovers expired started task", async () => {

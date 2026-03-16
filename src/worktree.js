@@ -1,5 +1,9 @@
+const fs = require("fs/promises");
 const path = require("path");
 const { runCommand } = require("./utils/process");
+const { copyPath, pathExists } = require("./utils/fs");
+
+const IGNORED_COPY_EXCLUDES = [".git", ".opencode-slave"];
 
 async function isGitRepo(rootDir) {
   const result = await runCommand({
@@ -26,10 +30,12 @@ function normalizeOptionalString(value) {
 function resolveWorktreeRefs(config, taskName, options = {}) {
   const overrideBranch = normalizeOptionalString(options.branchName);
   const overrideBase = normalizeOptionalString(options.baseBranch);
+  const useCurrentBranchAsBase = Boolean(options.useCurrentBranchAsBase);
 
   return {
     branch: overrideBranch || `${config.branchPrefix}${taskName}`,
-    baseBranch: overrideBase || config.baseBranch,
+    baseBranch: useCurrentBranchAsBase ? null : (overrideBase || config.baseBranch),
+    useCurrentBranchAsBase,
   };
 }
 
@@ -39,7 +45,13 @@ function getBranchName(config, taskName, options = {}) {
 
 async function createWorktree(rootDir, config, taskName, options = {}) {
   const worktreePath = getWorktreePath(rootDir, config, taskName);
-  const { branch, baseBranch } = resolveWorktreeRefs(config, taskName, options);
+  const refs = resolveWorktreeRefs(config, taskName, options);
+  const branch = refs.branch;
+  const baseBranch = refs.useCurrentBranchAsBase ? await getCurrentBranch(rootDir) : refs.baseBranch;
+
+  if (!baseBranch) {
+    throw new Error(`Unable to resolve base branch for '${taskName}'.`);
+  }
 
   await runCommand({
     command: `git fetch origin ${baseBranch}`,
@@ -78,11 +90,74 @@ async function createWorktree(rootDir, config, taskName, options = {}) {
     );
   }
 
+  await copyIgnoredFilesToWorktree(rootDir, worktreePath);
+
   return {
     worktreePath,
     branch,
     baseBranch,
   };
+}
+
+async function getCurrentBranch(rootDir) {
+  const result = await runCommand({
+    command: "git branch --show-current",
+    cwd: rootDir,
+  });
+
+  if (result.code !== 0) {
+    throw new Error(`Unable to detect current branch: ${result.stderr || result.stdout}`);
+  }
+
+  const branch = normalizeOptionalString(result.stdout);
+  if (!branch) {
+    throw new Error("Current HEAD is detached; cannot use current branch as base.");
+  }
+
+  return branch;
+}
+
+function shouldSkipIgnoredPath(relativePath) {
+  const normalized = String(relativePath || "").replace(/\\/g, "/").replace(/^\.\//, "");
+  return IGNORED_COPY_EXCLUDES.some(
+    (prefix) => normalized === prefix || normalized.startsWith(`${prefix}/`)
+  );
+}
+
+async function listIgnoredPaths(rootDir) {
+  const result = await runCommand({
+    command: "git ls-files --others -i --exclude-standard -z",
+    cwd: rootDir,
+  });
+
+  if (result.code !== 0) {
+    throw new Error(`Unable to list ignored files: ${result.stderr || result.stdout}`);
+  }
+
+  return (result.stdout || "")
+    .split("\u0000")
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .filter((entry) => !shouldSkipIgnoredPath(entry));
+}
+
+async function copyIgnoredFilesToWorktree(rootDir, worktreePath) {
+  const ignoredPaths = await listIgnoredPaths(rootDir);
+
+  for (const relativePath of ignoredPaths) {
+    const sourcePath = path.join(rootDir, relativePath);
+    const destinationPath = path.join(worktreePath, relativePath);
+    if (!(await pathExists(sourcePath))) {
+      continue;
+    }
+
+    const destinationExists = await pathExists(destinationPath);
+    if (destinationExists) {
+      await fs.rm(destinationPath, { recursive: true, force: true });
+    }
+
+    await copyPath(sourcePath, destinationPath);
+  }
 }
 
 async function hasWorktreeChanges(worktreePath) {
@@ -122,7 +197,7 @@ async function autoCommit(worktreePath, taskName) {
   return result;
 }
 
-async function maybeCreatePr(worktreePath, config, branch) {
+async function maybeCreatePr(worktreePath, config, branch, baseBranch = config.baseBranch) {
   const auth = await runCommand({ command: "gh auth status", cwd: worktreePath });
   if (auth.code !== 0) {
     return {
@@ -142,7 +217,7 @@ async function maybeCreatePr(worktreePath, config, branch) {
 
   const bodyPath = path.join(".opencode-slave", "templates", "pr.md");
   const pr = await runCommand({
-    command: `gh pr create --base "${config.baseBranch}" --head "${branch}" --title "slave: ${branch}" --body-file "${bodyPath}"`,
+    command: `gh pr create --base "${baseBranch}" --head "${branch}" --title "slave: ${branch}" --body-file "${bodyPath}"`,
     cwd: worktreePath,
   });
 
@@ -171,4 +246,7 @@ module.exports = {
   pruneWorktrees,
   autoCommit,
   maybeCreatePr,
+  listIgnoredPaths,
+  copyIgnoredFilesToWorktree,
+  getCurrentBranch,
 };
